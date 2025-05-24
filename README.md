@@ -1,0 +1,1 @@
+# QT_PNG_Info
