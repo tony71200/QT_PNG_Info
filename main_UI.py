@@ -139,10 +139,13 @@ class MainWindow(QMainWindow):
         self.btn_find.clicked.connect(self.find_in_prompts)
         self.btn_replace = QPushButton("Replace")
         self.btn_replace.clicked.connect(self.replace_in_prompts)
+        self.btn_replace_all = QPushButton("Replace All")
+        self.btn_replace_all.clicked.connect(self.replace_all_in_prompts)
         replace_layout.addWidget(self.txt_find, 0, 0, 1, 2)
         replace_layout.addWidget(self.btn_find, 0, 2)
         replace_layout.addWidget(self.txt_replace, 1, 0, 1, 2)
         replace_layout.addWidget(self.btn_replace, 1, 2)
+        replace_layout.addWidget(self.btn_replace_all, 2, 0, 1, 3)
         self.chk_autosave = QCheckBox("Auto Save")
         self.btn_save = QPushButton("Save")
         self.btn_save.clicked.connect(self.save_prompt_file)
@@ -324,6 +327,132 @@ class MainWindow(QMainWindow):
                 self.save_prompt_file()
         else:
             self.statusBar().showMessage("Không tìm thấy nội dung để thay thế")
+
+    def replace_all_in_prompts(self):
+        find_text = self.txt_find.text().strip()
+        replace_text = self.txt_replace.text()
+        if not find_text:
+            self.statusBar().showMessage("Nhập nội dung cần thay thế")
+            return
+        if not self.folder_path or self.list_images.count() == 0:
+            self.statusBar().showMessage("Chưa có thư mục hoặc ảnh để thay thế")
+            return
+
+        replacements = 0
+        for idx in range(self.list_images.count()):
+            item = self.list_images.item(idx)
+            if not item:
+                continue
+            image_path = item.data(Qt.UserRole)
+            positive, negative, size_str = self._read_prompt_data(image_path)
+            original_positive = positive or ""
+            original_negative = negative or ""
+            new_positive = original_positive.replace(find_text, replace_text)
+            new_negative = original_negative.replace(find_text, replace_text)
+            if new_positive != original_positive or new_negative != original_negative:
+                self._write_prompt_file(image_path, new_positive, new_negative, size_str)
+                replacements += 1
+                if image_path == self.current_image_path:
+                    self.txt_positive.blockSignals(True)
+                    self.txt_positive.setPlainText(new_positive)
+                    self.txt_positive.blockSignals(False)
+                    self.txt_negative.blockSignals(True)
+                    self.txt_negative.setPlainText(new_negative)
+                    self.txt_negative.blockSignals(False)
+
+        if replacements:
+            self.statusBar().showMessage(f"Đã thay thế trong {replacements} ảnh")
+        else:
+            self.statusBar().showMessage("Không tìm thấy nội dung để thay thế trong thư mục")
+
+    def _normalize_prompt_text(self, text):
+        if not text:
+            return ""
+        parts = [segment.strip() for segment in text.split("\n") if segment.strip()]
+        if not parts:
+            return ""
+        return " ".join(parts)
+
+    def _size_string_from_dimensions(self, width, height):
+        if not width or not height:
+            return "832x1216"
+        if width > height:
+            return "1216x832"
+        if width < height:
+            return "832x1216"
+        return "1024x1024"
+
+    def _infer_size_from_image(self, image_path):
+        pixmap = QPixmap(image_path)
+        if pixmap.isNull():
+            return "832x1216"
+        return self._size_string_from_dimensions(pixmap.width(), pixmap.height())
+
+    def _read_prompt_data(self, image_path):
+        prompt_path = os.path.splitext(image_path)[0] + ".txt"
+        positive = ""
+        negative = ""
+        size_str = None
+        if os.path.exists(prompt_path):
+            try:
+                with open(prompt_path, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                parts = content.split("###")
+                if parts:
+                    positive = parts[0].strip()
+                if len(parts) > 1:
+                    negative = parts[1].strip()
+                if len(parts) > 2 and parts[2].strip():
+                    size_str = parts[2].strip()
+            except Exception:
+                positive = negative = ""
+                size_str = None
+        else:
+            meta_text = None
+            try:
+                from PIL import Image
+                import PIL
+                img = Image.open(image_path)
+                info = img.info
+                for k in ['parameters', 'Description', 'prompt', 'Comment', 'Software']:
+                    if k in info and isinstance(info[k], str) and len(info[k]) > 10:
+                        meta_text = info[k]
+                        break
+                if meta_text is None and hasattr(img, '_getexif') and img._getexif():
+                    exif = img._getexif()
+                    if exif:
+                        for tag, value in exif.items():
+                            decoded = PIL.ExifTags.TAGS.get(tag, tag)
+                            if decoded in ['UserComment', 'ImageDescription', 'XPComment', 'XPSubject'] and isinstance(value, str) and len(value) > 10:
+                                meta_text = value
+                                break
+            except Exception:
+                meta_text = None
+            if meta_text:
+                meta = self.parse_metadata(meta_text)
+                positive = meta.get("Positive prompt", "")
+                negative = meta.get("Negative prompt", "")
+                size_str = meta.get("Size")
+
+        if not size_str:
+            size_str = self._infer_size_from_image(image_path)
+        return positive, negative, size_str
+
+    def _write_prompt_file(self, image_path, positive, negative, size_str):
+        prompt_path = os.path.splitext(image_path)[0] + ".txt"
+        positive_text = self._normalize_prompt_text(positive)
+        negative_text = self._normalize_prompt_text(negative)
+
+        if not positive_text:
+            positive_text = "1boy, 1 man"
+        if not negative_text:
+            negative_text = "(1girl, woman, female)"
+        if not size_str:
+            size_str = self._infer_size_from_image(image_path)
+
+        content = f"{positive_text}###{negative_text}###{size_str}"
+        with open(prompt_path, "w", encoding="utf-8") as f:
+            f.write(content)
 
     def load_metadata_content(self, image_path):
         # Đọc metadata trực tiếp từ file ảnh (PNG/JPG)
