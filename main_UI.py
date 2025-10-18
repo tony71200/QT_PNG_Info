@@ -1,14 +1,16 @@
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QPushButton, QLabel,
     QFileDialog, QHBoxLayout, QVBoxLayout, QTextEdit, QCheckBox,
-    QListWidget, QListWidgetItem, QSplitter, QSizePolicy, QFrame, QTreeWidgetItem
+    QListWidget, QListWidgetItem, QSplitter, QSizePolicy, QFrame, QTreeWidgetItem,
+    QLineEdit, QGridLayout
 )
-from PyQt5.QtGui import QIcon, QPixmap, QDragEnterEvent, QDropEvent
-from PyQt5.QtCore import Qt, QSize
+from PyQt5.QtGui import QIcon, QPixmap, QDragEnterEvent, QDropEvent, QTextCursor, QFontMetrics
+from PyQt5.QtCore import Qt, QSize, QEvent
 import sys
 import os
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+import re
 
 class ImageDropLabel(QLabel):
     def __init__(self, parent=None):
@@ -39,6 +41,7 @@ class MainWindow(QMainWindow):
 
         self.folder_path = ""
         self.current_image_path = ""
+        self.current_pixmap = QPixmap()
 
         self.init_ui()
         self.statusBar().showMessage("Ready")
@@ -82,17 +85,20 @@ class MainWindow(QMainWindow):
         self.lbl_image.setMinimumHeight(400)
         self.lbl_image.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.lbl_image.image_dropped_callback = self.handle_dropped_images
+        self.lbl_image.installEventFilter(self)
 
         self.list_images = QListWidget()
-        self.list_images.setFixedHeight(150)
+        self.list_images.setMinimumHeight(180)
         self.list_images.setViewMode(QListWidget.IconMode)
         self.list_images.setIconSize(QSize(100, 100))
         self.list_images.setResizeMode(QListWidget.Adjust)
         self.list_images.setMovement(QListWidget.Static)
+        self.list_images.setSpacing(8)
+        self.list_images.setUniformItemSizes(True)
         self.list_images.itemClicked.connect(self.display_selected_image)
 
-        image_layout.addWidget(self.lbl_image)
-        image_layout.addWidget(self.list_images)
+        image_layout.addWidget(self.lbl_image, 3)
+        image_layout.addWidget(self.list_images, 1)
 
         # ----- KHU PROMPT (PHẢI) -----
         # Tab Layout cho Prompt
@@ -120,11 +126,29 @@ class MainWindow(QMainWindow):
         self.txt_positive.setPlaceholderText("Positive Prompt (e.g. masterpiece, 8k, detailed)")
         self.txt_negative = QTextEdit()
         self.txt_negative.setPlaceholderText("Negative Prompt (e.g. low quality, blurry)")
+        replace_widget = QWidget()
+        replace_layout = QGridLayout()
+        replace_widget.setLayout(replace_layout)
+        replace_layout.setColumnStretch(0, 1)
+        replace_layout.setColumnStretch(1, 1)
+        self.txt_find = QLineEdit()
+        self.txt_find.setPlaceholderText("Find text")
+        self.txt_replace = QLineEdit()
+        self.txt_replace.setPlaceholderText("Replace with")
+        self.btn_find = QPushButton("Find")
+        self.btn_find.clicked.connect(self.find_in_prompts)
+        self.btn_replace = QPushButton("Replace")
+        self.btn_replace.clicked.connect(self.replace_in_prompts)
+        replace_layout.addWidget(self.txt_find, 0, 0, 1, 2)
+        replace_layout.addWidget(self.btn_find, 0, 2)
+        replace_layout.addWidget(self.txt_replace, 1, 0, 1, 2)
+        replace_layout.addWidget(self.btn_replace, 1, 2)
         self.chk_autosave = QCheckBox("Auto Save")
         self.btn_save = QPushButton("Save")
         self.btn_save.clicked.connect(self.save_prompt_file)
         edit_layout.addWidget(self.txt_positive)
         edit_layout.addWidget(self.txt_negative)
+        edit_layout.addWidget(replace_widget)
         edit_layout.addWidget(self.chk_autosave)
         edit_layout.addWidget(self.btn_save)
 
@@ -156,12 +180,15 @@ class MainWindow(QMainWindow):
 
         image_files = [f for f in os.listdir(folder) if any(f.lower().endswith(ext) for ext in image_extensions)]
         image_files.sort()
+        metrics = QFontMetrics(self.list_images.font())
 
         for file in image_files:
             full_path = os.path.join(folder, file)
             icon = QIcon(full_path)
-            item = QListWidgetItem(icon, file)
+            display_name = metrics.elidedText(file, Qt.ElideMiddle, 140)
+            item = QListWidgetItem(icon, display_name)
             item.setData(Qt.UserRole, full_path)
+            item.setToolTip(file)
             self.list_images.addItem(item)
 
         if self.list_images.count() > 0:
@@ -181,12 +208,29 @@ class MainWindow(QMainWindow):
         self.current_image_path = path
         pixmap = QPixmap(path)
         if not pixmap.isNull():
-            scaled = pixmap.scaled(self.lbl_image.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self.lbl_image.setPixmap(scaled)
+            self.current_pixmap = pixmap
+            self.update_image_display()
             self.statusBar().showMessage(path)
         else:
+            self.current_pixmap = QPixmap()
             self.lbl_image.setText("Không thể hiển thị ảnh")
             self.statusBar().showMessage("Không thể hiển thị ảnh")
+
+    def update_image_display(self):
+        if not self.current_pixmap.isNull() and not self.lbl_image.size().isEmpty():
+            scaled = self.current_pixmap.scaled(
+                self.lbl_image.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            self.lbl_image.setPixmap(scaled)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update_image_display()
+
+    def eventFilter(self, obj, event):
+        if obj == self.lbl_image and event.type() == QEvent.Resize:
+            self.update_image_display()
+        return super().eventFilter(obj, event)
 
     def load_prompt_file(self, image_path):
         prompt_path = os.path.splitext(image_path)[0] + ".txt"
@@ -229,6 +273,58 @@ class MainWindow(QMainWindow):
             self.txt_positive.clear()
             self.txt_negative.clear()
 
+    def _find_in_text_edit(self, text_edit, query):
+        if not query:
+            return False
+        original_cursor = text_edit.textCursor()
+        cursor = text_edit.textCursor()
+        cursor.movePosition(QTextCursor.Start)
+        text_edit.setTextCursor(cursor)
+        found = text_edit.find(query)
+        if not found:
+            text_edit.setTextCursor(original_cursor)
+            return False
+        text_edit.setFocus()
+        return True
+
+    def find_in_prompts(self):
+        query = self.txt_find.text().strip()
+        if not query:
+            self.statusBar().showMessage("Nhập nội dung cần tìm")
+            return
+        if self._find_in_text_edit(self.txt_positive, query):
+            self.tab_prompt.setCurrentWidget(self.tab_edit)
+            self.statusBar().showMessage("Đã tìm thấy trong Positive Prompt")
+            return
+        if self._find_in_text_edit(self.txt_negative, query):
+            self.tab_prompt.setCurrentWidget(self.tab_edit)
+            self.statusBar().showMessage("Đã tìm thấy trong Negative Prompt")
+            return
+        self.statusBar().showMessage("Không tìm thấy nội dung cần tìm")
+
+    def replace_in_prompts(self):
+        find_text = self.txt_find.text().strip()
+        replace_text = self.txt_replace.text()
+        if not find_text:
+            self.statusBar().showMessage("Nhập nội dung cần thay thế")
+            return
+        replaced = False
+        for text_edit in (self.txt_positive, self.txt_negative):
+            content = text_edit.toPlainText()
+            if find_text in content:
+                new_content = content.replace(find_text, replace_text)
+                if new_content != content:
+                    text_edit.blockSignals(True)
+                    text_edit.setPlainText(new_content)
+                    text_edit.blockSignals(False)
+                    replaced = True
+        if replaced:
+            self.statusBar().showMessage("Đã thay thế nội dung")
+            if self.chk_autosave.isChecked():
+                self.save_prompt_file()
+        else:
+            self.statusBar().showMessage("Không tìm thấy nội dung để thay thế")
+
     def load_metadata_content(self, image_path):
         # Đọc metadata trực tiếp từ file ảnh (PNG/JPG)
         from PIL import Image
@@ -261,7 +357,7 @@ class MainWindow(QMainWindow):
         meta = self.parse_metadata(meta_text)
         wrap_len = 80  # Số ký tự tối đa mỗi dòng
         for key in [
-            "Positive prompt", "Negative prompt", "Steps", "Sampler", "Schedule type", "CFG scale", "Seed", "Face restoration", "Size", "Model hash", "Model", "Clip skip", "Token merging ratio", "Lora hash", "Other", "Version"]:
+            "Positive prompt", "Negative prompt", "Steps", "Sampler", "Schedule type", "CFG scale", "Seed", "Face restoration", "Size", "Width", "Height", "Model hash", "Model", "Clip skip", "Token merging ratio", "Lora hash", "Other", "Version"]:
             val = meta.get(key, "")
             if val:
                 # Tự động wrapped nếu quá dài
@@ -271,62 +367,122 @@ class MainWindow(QMainWindow):
                 self.tree_metadata.addTopLevelItem(item)
 
     def parse_metadata(self, content):
-        # Tách positive/negative prompt
-        meta = {}
-        pos = ""
-        neg = ""
-        other = {}
-        lines = content.splitlines()
-        text = content
-        # Tìm vị trí Negative prompt:
-        idx = text.find("Negative prompt:")
-        if idx != -1:
-            pos = text[:idx].strip()
-            rest = text[idx:]
-            # Tìm các key
-            keys = [
-                "Negative prompt:", "Steps:", "Sampler:", "Schedule type:", "CFG scale:", "Seed:", "Face restoration:", "Size:", "Model hash:", "Model:", "Clip skip:", "Token merging ratio:", "Lora hash:", "Version:", "ControlNet 0:"]
-            for k in keys:
-                kidx = rest.find(k)
-                if kidx != -1:
-                    val_start = kidx + len(k)
-                    # Tìm kết thúc
-                    next_idx = len(rest)
-                    for k2 in keys:
-                        if k2 == k:
-                            continue
-                        k2idx = rest.find(k2, val_start)
-                        if k2idx != -1 and k2idx < next_idx:
-                            next_idx = k2idx
-                    val = rest[val_start:next_idx].strip().strip(",")
-                    key_name = k.replace(":", "").strip()
-                    if k == "Negative prompt:":
-                        neg = val
-                    else:
-                        meta[key_name] = val
-            meta["Positive prompt"] = pos
-            meta["Negative prompt"] = neg
-            # Tìm các nội dung dư
-            known_keys = [k.replace(":", "").strip() for k in keys]
-            # Lấy các phần còn lại
-            import re
-            for m in re.finditer(r"(\w[\w ]*):", rest):
-                k = m.group(1).strip()
-                if k not in known_keys:
-                    # Lấy value
-                    start = m.end()
-                    end = rest.find("\n", start)
-                    if end == -1:
-                        end = len(rest)
-                    val = rest[start:end].strip().strip(",")
-                    other[k] = val
-            if other:
-                meta["Other"] = str(other)
+        if not content:
+            return {}
+        blocks = re.split(r"(?:\r?\n){2,}", content.strip())
+        selected_meta = {}
+        for block in blocks:
+            meta, has_tony = self.parse_block(block)
+            if meta:
+                if has_tony:
+                    return meta
+                if not selected_meta:
+                    selected_meta = meta
+        return selected_meta
+
+    def parse_block(self, block):
+        technical_fields = [
+            r"Steps\s*:\s*\d+",
+            r"Sampler\s*:\s*[^,\n]+",
+            r"CFG scale\s*:\s*[^,\n]+",
+            r"Size\s*:\s*\d+[xX×]\d+",
+            r"Seed\s*:\s*\d+",
+            r"Model\s*:\s*[^,\n]+",
+            r"Width\s*:\s*\d+",
+            r"Height\s*:\s*\d+"
+        ]
+        tech_pattern = re.compile(r"|".join(technical_fields), re.IGNORECASE)
+
+        lines = [line.strip() for line in block.strip().split("\n") if line.strip()]
+        if not lines:
+            return {}, False
+
+        prompt_lines, negative_lines = [], []
+        tech_data = {}
+        in_negative = False
+        width = height = seed = None
+        size_str = None
+        has_tony = any(line.lower().endswith("tony") for line in lines)
+        field_map = {
+            "steps": "Steps",
+            "sampler": "Sampler",
+            "cfg scale": "CFG scale",
+            "size": "Size",
+            "seed": "Seed",
+            "model": "Model",
+            "width": "Width",
+            "height": "Height"
+        }
+
+        for line in lines:
+            lower_line = line.lower()
+            if lower_line.startswith("negative prompt:"):
+                in_negative = True
+                negative_lines.append(line.split(":", 1)[1].strip())
+                continue
+            if in_negative:
+                if tech_pattern.search(line):
+                    in_negative = False
+                else:
+                    negative_lines.append(line)
+                    continue
+            if tech_pattern.search(line):
+                segments = [seg.strip() for seg in re.split(r",\s*(?=[^:,]+:\s*)", line) if seg.strip()]
+                for segment in segments:
+                    if not re.search(r":", segment):
+                        continue
+                    parts = segment.split(":", 1)
+                    key_raw = parts[0].strip()
+                    value = parts[1].strip().strip(",")
+                    canonical = field_map.get(key_raw.lower(), key_raw)
+                    tech_data[canonical] = value
+                    m = re.search(r"Width\s*:\s*(\d+)", segment, re.IGNORECASE)
+                    if m:
+                        width = int(m.group(1))
+                    m = re.search(r"Height\s*:\s*(\d+)", segment, re.IGNORECASE)
+                    if m:
+                        height = int(m.group(1))
+                    m = re.search(r"Size\s*:\s*(\d+)[xX×](\d+)", segment, re.IGNORECASE)
+                    if m:
+                        width = int(m.group(1))
+                        height = int(m.group(2))
+                    m = re.search(r"Seed\s*:\s*(\d+)", segment, re.IGNORECASE)
+                    if m:
+                        seed = int(m.group(1))
+                continue
+            if not lower_line.startswith("negative prompt:"):
+                prompt_lines.append(line)
+
+        prompt = " ".join(prompt_lines).replace("  ", " ").replace(" , ", ", ").strip()
+        negative_prompt = " ".join(negative_lines).replace("  ", " ").replace(" , ", ",").strip()
+        if not negative_prompt:
+            negative_prompt = "(1girl, female, woman, vagina,pussy,vaginal,clitoris, beard)"
+
+        if width and height:
+            if width > height:
+                size_str = "1216x832"
+            elif width < height:
+                size_str = "832x1216"
+            else:
+                size_str = "1024x1024"
         else:
-            # Không có Negative prompt, lấy hết làm Positive
-            meta["Positive prompt"] = text.strip()
-            meta["Negative prompt"] = ""
-        return meta
+            size_str = "832x1216"
+        seed_val = seed if seed is not None else -1
+
+        meta = {
+            "Positive prompt": prompt,
+            "Negative prompt": negative_prompt,
+            "Size": size_str,
+            "Seed": str(seed_val)
+        }
+        for key in ("Steps", "Sampler", "CFG scale", "Model", "Width", "Height"):
+            if key in tech_data:
+                meta[key] = tech_data[key]
+        if "Width" not in meta and width:
+            meta["Width"] = str(width)
+        if "Height" not in meta and height:
+            meta["Height"] = str(height)
+        return meta, has_tony
 
     def save_prompt_file(self):
         if not self.current_image_path:
@@ -372,11 +528,14 @@ class MainWindow(QMainWindow):
         all_images = sorted([f for f in os.listdir(folder) if any(f.lower().endswith(ext) for ext in image_extensions)])
 
         self.list_images.clear()
+        metrics = QFontMetrics(self.list_images.font())
         for file in all_images:
             full_path = os.path.join(folder, file)
             icon = QIcon(full_path)
-            item = QListWidgetItem(icon, file)
+            display_name = metrics.elidedText(file, Qt.ElideMiddle, 140)
+            item = QListWidgetItem(icon, display_name)
             item.setData(Qt.UserRole, full_path)
+            item.setToolTip(file)
             self.list_images.addItem(item)
 
         # Hiển thị ảnh đầu tiên trong danh sách kéo vào
