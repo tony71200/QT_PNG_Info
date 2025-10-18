@@ -235,6 +235,64 @@ class MainWindow(QMainWindow):
             self.update_image_display()
         return super().eventFilter(obj, event)
 
+    def _extract_metadata_text(self, image_path):
+        meta_text = None
+        meta_key = None
+        try:
+            from PIL import Image
+            import PIL
+
+            with Image.open(image_path) as img:
+                info = getattr(img, "info", {}) or {}
+                for key in ['parameters', 'Description', 'prompt', 'Comment', 'Software']:
+                    value = info.get(key)
+                    if isinstance(value, str) and len(value) > 10:
+                        meta_text = value
+                        meta_key = key
+                        break
+                if meta_text is None and hasattr(img, '_getexif') and img._getexif():
+                    exif = img._getexif()
+                    if exif:
+                        for tag, value in exif.items():
+                            decoded = PIL.ExifTags.TAGS.get(tag, tag)
+                            if decoded in ['UserComment', 'ImageDescription', 'XPComment', 'XPSubject'] and isinstance(value, str) and len(value) > 10:
+                                meta_text = value
+                                meta_key = decoded
+                                break
+        except Exception:
+            meta_text = None
+            meta_key = None
+        return meta_text, meta_key
+
+    def _format_metadata_text(self, meta):
+        if not meta:
+            return ""
+
+        positive = meta.get("Positive prompt", "").strip()
+        negative = meta.get("Negative prompt", "").strip()
+
+        lines = []
+        if positive:
+            lines.append(positive)
+        if negative:
+            lines.append(f"Negative prompt: {negative}")
+
+        field_order = [
+            "Steps", "Sampler", "Schedule type", "CFG scale", "Seed", "Face restoration",
+            "Size", "Width", "Height", "Model hash", "Model", "Clip skip",
+            "Token merging ratio", "Lora hash", "Other", "Version"
+        ]
+        extras = []
+        for key in field_order:
+            if key in ("Positive prompt", "Negative prompt"):
+                continue
+            value = meta.get(key)
+            if value:
+                extras.append(f"{key}: {value}")
+        if extras:
+            lines.append(", ".join(extras))
+        return "\n".join(lines).strip()
+
     def load_prompt_file(self, image_path):
         prompt_path = os.path.splitext(image_path)[0] + ".txt"
         if os.path.exists(prompt_path):
@@ -246,28 +304,7 @@ class MainWindow(QMainWindow):
                     self.txt_positive.setText(parts[0])
                     self.txt_negative.setText(parts[1])
         elif os.path.exists(image_path):
-            from PIL import Image
-            import PIL
-            meta_text = None
-            try:
-                img = Image.open(image_path)
-                info = img.info
-                # PNG: metadata thường nằm trong info['parameters'] hoặc info['Description'] hoặc info['prompt']
-                for k in ['parameters', 'Description', 'prompt', 'Comment', 'Software']:
-                    if k in info and isinstance(info[k], str) and len(info[k]) > 10:
-                        meta_text = info[k]
-                        break
-                # JPEG: metadata có thể nằm trong EXIF (UserComment, ImageDescription...)
-                if meta_text is None and hasattr(img, '_getexif') and img._getexif():
-                    exif = img._getexif()
-                    if exif:
-                        for tag, value in exif.items():
-                            decoded = PIL.ExifTags.TAGS.get(tag, tag)
-                            if decoded in ['UserComment', 'ImageDescription', 'XPComment', 'XPSubject'] and isinstance(value, str) and len(value) > 10:
-                                meta_text = value
-                                break
-            except Exception as e:
-                meta_text = None
+            meta_text, _ = self._extract_metadata_text(image_path)
             # Nếu không đúng format, tìm positive/negative prompt trong metadata
             meta = self.parse_metadata(meta_text) if meta_text else {}
             self.txt_positive.setText(meta.get("Positive prompt", ""))
@@ -323,8 +360,13 @@ class MainWindow(QMainWindow):
                     replaced = True
         if replaced:
             self.statusBar().showMessage("Đã thay thế nội dung")
-            if self.chk_autosave.isChecked():
-                self.save_prompt_file()
+            if self.chk_autosave.isChecked() and self.current_image_path:
+                self._write_prompt_file(
+                    self.current_image_path,
+                    self.txt_positive.toPlainText(),
+                    self.txt_negative.toPlainText(),
+                    None,
+                )
         else:
             self.statusBar().showMessage("Không tìm thấy nội dung để thay thế")
 
@@ -408,26 +450,7 @@ class MainWindow(QMainWindow):
                 positive = negative = ""
                 size_str = None
         else:
-            meta_text = None
-            try:
-                from PIL import Image
-                import PIL
-                img = Image.open(image_path)
-                info = img.info
-                for k in ['parameters', 'Description', 'prompt', 'Comment', 'Software']:
-                    if k in info and isinstance(info[k], str) and len(info[k]) > 10:
-                        meta_text = info[k]
-                        break
-                if meta_text is None and hasattr(img, '_getexif') and img._getexif():
-                    exif = img._getexif()
-                    if exif:
-                        for tag, value in exif.items():
-                            decoded = PIL.ExifTags.TAGS.get(tag, tag)
-                            if decoded in ['UserComment', 'ImageDescription', 'XPComment', 'XPSubject'] and isinstance(value, str) and len(value) > 10:
-                                meta_text = value
-                                break
-            except Exception:
-                meta_text = None
+            meta_text, _ = self._extract_metadata_text(image_path)
             if meta_text:
                 meta = self.parse_metadata(meta_text)
                 positive = meta.get("Positive prompt", "")
@@ -439,7 +462,6 @@ class MainWindow(QMainWindow):
         return positive, negative, size_str
 
     def _write_prompt_file(self, image_path, positive, negative, size_str):
-        prompt_path = os.path.splitext(image_path)[0] + ".txt"
         positive_text = self._normalize_prompt_text(positive)
         negative_text = self._normalize_prompt_text(negative)
 
@@ -450,36 +472,46 @@ class MainWindow(QMainWindow):
         if not size_str:
             size_str = self._infer_size_from_image(image_path)
 
+        meta_text, meta_key = self._extract_metadata_text(image_path)
+        meta = self.parse_metadata(meta_text) if meta_text else {}
+        meta["Positive prompt"] = positive_text
+        meta["Negative prompt"] = negative_text
+        if size_str:
+            meta["Size"] = size_str
+
+        formatted_meta = self._format_metadata_text(meta)
+
+        ext = os.path.splitext(image_path)[1].lower()
+        if ext in ['.png'] and formatted_meta:
+            try:
+                from PIL import Image, PngImagePlugin
+
+                with Image.open(image_path) as img:
+                    pnginfo = PngImagePlugin.PngInfo()
+                    target_key = meta_key or 'parameters'
+                    for key, value in getattr(img, 'info', {}).items():
+                        if not isinstance(value, str):
+                            continue
+                        if key == target_key:
+                            continue
+                        pnginfo.add_text(key, value)
+                    pnginfo.add_text(target_key, formatted_meta)
+                    img.save(image_path, pnginfo=pnginfo)
+                return
+            except Exception:
+                pass
+
+        # Fallback lưu định dạng txt cũ nếu không ghi được metadata
+        prompt_path = os.path.splitext(image_path)[0] + ".txt"
         content = f"{positive_text}###{negative_text}###{size_str}"
         with open(prompt_path, "w", encoding="utf-8") as f:
             f.write(content)
 
     def load_metadata_content(self, image_path):
         # Đọc metadata trực tiếp từ file ảnh (PNG/JPG)
-        from PIL import Image
-        import PIL
         import textwrap
         self.tree_metadata.clear()
-        meta_text = None
-        try:
-            img = Image.open(image_path)
-            info = img.info
-            # PNG: metadata thường nằm trong info['parameters'] hoặc info['Description'] hoặc info['prompt']
-            for k in ['parameters', 'Description', 'prompt', 'Comment', 'Software']:
-                if k in info and isinstance(info[k], str) and len(info[k]) > 10:
-                    meta_text = info[k]
-                    break
-            # JPEG: metadata có thể nằm trong EXIF (UserComment, ImageDescription...)
-            if meta_text is None and hasattr(img, '_getexif') and img._getexif():
-                exif = img._getexif()
-                if exif:
-                    for tag, value in exif.items():
-                        decoded = PIL.ExifTags.TAGS.get(tag, tag)
-                        if decoded in ['UserComment', 'ImageDescription', 'XPComment', 'XPSubject'] and isinstance(value, str) and len(value) > 10:
-                            meta_text = value
-                            break
-        except Exception as e:
-            meta_text = None
+        meta_text, _ = self._extract_metadata_text(image_path)
         if not meta_text:
             # Không có metadata
             return
@@ -617,31 +649,12 @@ class MainWindow(QMainWindow):
         if not self.current_image_path:
             return
 
-        positive = self.txt_positive.toPlainText().strip().split("\n")
-        positive = " ".join(positive)
-        negative = self.txt_negative.toPlainText().strip().split("\n")
-        negative = " ".join(negative)
-
-        image = QPixmap(self.current_image_path)
-        w, h = image.width(), image.height()
-        if w > h:
-            size_str = "1216x832"
-        elif h > w:
-            size_str = "832x1216"
-        else:
-            size_str = "1024x1024"
-
-        if not positive:
-            positive = "1boy, 1 man"
-
-        if not negative:
-            negative = "(1girl, woman, female)"
-
-        content = f"{positive}###{negative}###{size_str}"
-        prompt_path = os.path.splitext(self.current_image_path)[0] + ".txt"
-
-        with open(prompt_path, "w", encoding="utf-8") as f:
-            f.write(content)
+        self._write_prompt_file(
+            self.current_image_path,
+            self.txt_positive.toPlainText(),
+            self.txt_negative.toPlainText(),
+            None,
+        )
 
     def handle_dropped_images(self, image_paths):
         if not image_paths:
