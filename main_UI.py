@@ -2,15 +2,16 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QPushButton, QLabel,
     QFileDialog, QHBoxLayout, QVBoxLayout, QTextEdit, QCheckBox,
     QListWidget, QListWidgetItem, QSplitter, QSizePolicy, QFrame, QTreeWidgetItem,
-    QLineEdit, QGridLayout
+    QLineEdit, QGridLayout, QScrollArea, QFormLayout, QProgressDialog
 )
 from PyQt5.QtGui import QIcon, QPixmap, QDragEnterEvent, QDropEvent, QTextCursor, QFontMetrics
-from PyQt5.QtCore import Qt, QSize, QEvent
+from PyQt5.QtCore import Qt, QSize, QEvent, pyqtSignal, QObject, QThread
 import sys
 import os
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 import re
+from collections import OrderedDict
 
 class ImageDropLabel(QLabel):
     def __init__(self, parent=None):
@@ -33,6 +34,48 @@ class ImageDropLabel(QLabel):
             self.image_dropped_callback(image_paths)
 
 
+class ReplaceWorker(QObject):
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(int, list)
+    error = pyqtSignal(str)
+
+    def __init__(self, parent_window, image_paths, find_text, replace_text):
+        super().__init__()
+        self.parent_window = parent_window
+        self.image_paths = list(image_paths)
+        self.find_text = find_text
+        self.replace_text = replace_text
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        replacements = 0
+        changed_paths = []
+        total = len(self.image_paths)
+        try:
+            for index, image_path in enumerate(self.image_paths, start=1):
+                if self._cancelled:
+                    break
+                meta, meta_key = self.parent_window._load_image_metadata(image_path)
+                positive = meta.get("Positive prompt", "")
+                negative = meta.get("Negative prompt", "")
+                new_positive = positive.replace(self.find_text, self.replace_text)
+                new_negative = negative.replace(self.find_text, self.replace_text)
+                if new_positive != positive or new_negative != negative:
+                    meta = OrderedDict(meta)
+                    meta["Positive prompt"] = new_positive
+                    meta["Negative prompt"] = new_negative
+                    if not meta.get("Size"):
+                        meta["Size"] = self.parent_window._infer_size_from_image(image_path)
+                    self.parent_window._write_prompt_file(image_path, meta, meta_key)
+                    replacements += 1
+                    changed_paths.append(image_path)
+                self.progress.emit(index, total, os.path.basename(image_path))
+            self.finished.emit(replacements, changed_paths)
+        except Exception as exc:
+            self.error.emit(str(exc))
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -42,6 +85,12 @@ class MainWindow(QMainWindow):
         self.folder_path = ""
         self.current_image_path = ""
         self.current_pixmap = QPixmap()
+        self.current_metadata = OrderedDict()
+        self.current_meta_key = None
+        self.metadata_inputs = {}
+        self.metadata_keys_order = []
+        self.replace_thread = None
+        self.replace_worker = None
 
         self.init_ui()
         self.statusBar().showMessage("Ready")
@@ -126,6 +175,13 @@ class MainWindow(QMainWindow):
         self.txt_positive.setPlaceholderText("Positive Prompt (e.g. masterpiece, 8k, detailed)")
         self.txt_negative = QTextEdit()
         self.txt_negative.setPlaceholderText("Negative Prompt (e.g. low quality, blurry)")
+        self.meta_scroll = QScrollArea()
+        self.meta_scroll.setWidgetResizable(True)
+        self.meta_scroll.setMinimumHeight(160)
+        self.meta_form_container = QWidget()
+        self.meta_form_layout = QFormLayout()
+        self.meta_form_container.setLayout(self.meta_form_layout)
+        self.meta_scroll.setWidget(self.meta_form_container)
         replace_widget = QWidget()
         replace_layout = QGridLayout()
         replace_widget.setLayout(replace_layout)
@@ -151,6 +207,7 @@ class MainWindow(QMainWindow):
         self.btn_save.clicked.connect(self.save_prompt_file)
         edit_layout.addWidget(self.txt_positive)
         edit_layout.addWidget(self.txt_negative)
+        edit_layout.addWidget(self.meta_scroll)
         edit_layout.addWidget(replace_widget)
         edit_layout.addWidget(self.chk_autosave)
         edit_layout.addWidget(self.btn_save)
@@ -185,7 +242,18 @@ class MainWindow(QMainWindow):
         image_files.sort()
         metrics = QFontMetrics(self.list_images.font())
 
-        for file in image_files:
+        total = len(image_files)
+        progress = None
+        if total:
+            progress = QProgressDialog("Đang tải danh sách ảnh...", "Hủy", 0, total, self)
+            progress.setWindowTitle("Đang tải ảnh")
+            progress.setWindowModality(Qt.ApplicationModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+
+        for idx, file in enumerate(image_files, start=1):
+            if progress and progress.wasCanceled():
+                break
             full_path = os.path.join(folder, file)
             icon = QIcon(full_path)
             display_name = metrics.elidedText(file, Qt.ElideMiddle, 140)
@@ -193,6 +261,13 @@ class MainWindow(QMainWindow):
             item.setData(Qt.UserRole, full_path)
             item.setToolTip(file)
             self.list_images.addItem(item)
+            if progress:
+                progress.setValue(idx)
+                progress.setLabelText(f"Đang tải {file} ({idx}/{total})")
+                QApplication.processEvents()
+
+        if progress:
+            progress.close()
 
         if self.list_images.count() > 0:
             self.list_images.setCurrentRow(0)
@@ -204,8 +279,7 @@ class MainWindow(QMainWindow):
 
         image_path = item.data(Qt.UserRole)
         self.display_image_from_path(image_path)
-        self.load_prompt_file(image_path)
-        self.load_metadata_content(image_path)
+        self._load_and_apply_metadata(image_path)
 
     def display_image_from_path(self, path):
         self.current_image_path = path
@@ -267,9 +341,8 @@ class MainWindow(QMainWindow):
     def _format_metadata_text(self, meta):
         if not meta:
             return ""
-
-        positive = meta.get("Positive prompt", "").strip()
-        negative = meta.get("Negative prompt", "").strip()
+        positive = (meta.get("Positive prompt") or "").strip()
+        negative = (meta.get("Negative prompt") or "").strip()
 
         lines = []
         if positive:
@@ -277,41 +350,202 @@ class MainWindow(QMainWindow):
         if negative:
             lines.append(f"Negative prompt: {negative}")
 
-        field_order = [
-            "Steps", "Sampler", "Schedule type", "CFG scale", "Seed", "Face restoration",
-            "Size", "Width", "Height", "Model hash", "Model", "Clip skip",
-            "Token merging ratio", "Lora hash", "Other", "Version"
-        ]
         extras = []
-        for key in field_order:
+        for key, value in meta.items():
             if key in ("Positive prompt", "Negative prompt"):
                 continue
-            value = meta.get(key)
-            if value:
-                extras.append(f"{key}: {value}")
+            if value is None:
+                continue
+            value_str = str(value).strip()
+            if not value_str:
+                continue
+            extras.append(f"{key}: {value_str}")
         if extras:
             lines.append(", ".join(extras))
         return "\n".join(lines).strip()
 
-    def load_prompt_file(self, image_path):
+    def _looks_like_metadata(self, line):
+        if not line:
+            return False
+        lower = line.strip().lower()
+        if not lower or lower.startswith("negative prompt:"):
+            return False
+        if ": " in line:
+            return True
+        known_prefixes = [
+            "steps:", "sampler:", "schedule type:", "cfg scale:", "seed:", "size:",
+            "model:", "model hash:", "model version:", "clip skip:", "lora",
+            "loras:", "lora hashes:", "lorahash:", "hash:", "vae:", "vae hash:",
+            "h-nag:", "version:", "face restoration:", "denoising strength:",
+            "token merging ratio:", "hires", "upscaler:", "tiling:", "ensd:",
+            "refiner:", "refiner switch:", "controlnet", "cfg rescale:", "scheduler:",
+            "clip skip:", "vae hash:"
+        ]
+        return any(lower.startswith(prefix) for prefix in known_prefixes)
+
+    def _split_metadata_pairs(self, text):
+        segments = []
+        current = []
+        depth_round = depth_square = depth_curly = 0
+        for ch in text:
+            if ch == ',' and depth_round == depth_square == depth_curly == 0:
+                segment = ''.join(current).strip()
+                if segment:
+                    segments.append(segment)
+                current = []
+                continue
+            current.append(ch)
+            if ch == '(':
+                depth_round += 1
+            elif ch == ')':
+                depth_round = max(0, depth_round - 1)
+            elif ch == '[':
+                depth_square += 1
+            elif ch == ']':
+                depth_square = max(0, depth_square - 1)
+            elif ch == '{':
+                depth_curly += 1
+            elif ch == '}':
+                depth_curly = max(0, depth_curly - 1)
+        if current:
+            segment = ''.join(current).strip()
+            if segment:
+                segments.append(segment)
+
+        pairs = []
+        for segment in segments:
+            if ':' not in segment:
+                continue
+            key, value = segment.split(':', 1)
+            pairs.append((key.strip(), value.strip().strip(',')))
+        return pairs
+
+    def _to_int(self, value):
+        if value is None:
+            return None
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+
+    def _clear_metadata_form(self):
+        while self.meta_form_layout.count():
+            item = self.meta_form_layout.takeAt(0)
+            if item:
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+        self.metadata_inputs = {}
+        self.metadata_keys_order = []
+
+    def _populate_metadata_inputs(self, meta):
+        self._clear_metadata_form()
+        added_field = False
+        for key, value in meta.items():
+            if key in ("Positive prompt", "Negative prompt"):
+                continue
+            widget = QTextEdit() if isinstance(value, str) and ("\n" in value or len(value) > 160) else QLineEdit()
+            if isinstance(widget, QTextEdit):
+                widget.setPlainText(str(value))
+                widget.setFixedHeight(80)
+            else:
+                widget.setText(str(value))
+            self.meta_form_layout.addRow(f"{key}", widget)
+            self.metadata_inputs[key] = widget
+            self.metadata_keys_order.append(key)
+            added_field = True
+        if not added_field:
+            placeholder = QLabel("No additional metadata fields")
+            self.meta_form_layout.addRow("", placeholder)
+
+    def _gather_metadata_from_inputs(self):
+        meta = OrderedDict()
+        meta["Positive prompt"] = self.txt_positive.toPlainText().strip()
+        meta["Negative prompt"] = self.txt_negative.toPlainText().strip()
+        for key in self.metadata_keys_order:
+            widget = self.metadata_inputs.get(key)
+            if widget is None:
+                continue
+            if isinstance(widget, QTextEdit):
+                value = widget.toPlainText().strip()
+            else:
+                value = widget.text().strip()
+            meta[key] = value
+        return meta
+
+    def _update_prompt_editors(self, meta):
+        positive = meta.get("Positive prompt", "") if meta else ""
+        negative = meta.get("Negative prompt", "") if meta else ""
+        self.txt_positive.blockSignals(True)
+        self.txt_positive.setPlainText(positive)
+        self.txt_positive.blockSignals(False)
+        self.txt_negative.blockSignals(True)
+        self.txt_negative.setPlainText(negative)
+        self.txt_negative.blockSignals(False)
+
+    def _populate_metadata_tree(self, meta):
+        self.tree_metadata.clear()
+        if not meta:
+            return
+        import textwrap
+        wrap_len = 80
+        for key, value in meta.items():
+            if value is None:
+                continue
+            display_value = str(value)
+            if len(display_value) > wrap_len:
+                display_value = '\n'.join(textwrap.wrap(display_value, wrap_len))
+            item = QTreeWidgetItem([key, display_value])
+            self.tree_metadata.addTopLevelItem(item)
+
+    def _load_and_apply_metadata(self, image_path):
+        meta, meta_key = self._load_image_metadata(image_path)
+        self.current_metadata = meta
+        self.current_meta_key = meta_key
+        self._update_prompt_editors(meta)
+        self._populate_metadata_inputs(meta)
+        self._populate_metadata_tree(meta)
+
+    def _load_image_metadata(self, image_path):
+        meta_text, meta_key = self._extract_metadata_text(image_path)
+        parsed_meta = self.parse_metadata(meta_text) if meta_text else OrderedDict()
+
         prompt_path = os.path.splitext(image_path)[0] + ".txt"
+        txt_positive = txt_negative = txt_size = None
         if os.path.exists(prompt_path):
-            with open(prompt_path, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-                # Nếu đúng format cũ: <positive>###<negative>###size
+            try:
+                with open(prompt_path, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
                 parts = content.split("###")
-                if len(parts) >= 2:
-                    self.txt_positive.setText(parts[0])
-                    self.txt_negative.setText(parts[1])
-        elif os.path.exists(image_path):
-            meta_text, _ = self._extract_metadata_text(image_path)
-            # Nếu không đúng format, tìm positive/negative prompt trong metadata
-            meta = self.parse_metadata(meta_text) if meta_text else {}
-            self.txt_positive.setText(meta.get("Positive prompt", ""))
-            self.txt_negative.setText(meta.get("Negative prompt", ""))
-        else:
-            self.txt_positive.clear()
-            self.txt_negative.clear()
+                if parts:
+                    txt_positive = parts[0].strip()
+                if len(parts) > 1:
+                    txt_negative = parts[1].strip()
+                if len(parts) > 2 and parts[2].strip():
+                    txt_size = parts[2].strip()
+            except Exception:
+                txt_positive = txt_negative = txt_size = None
+
+        meta = OrderedDict()
+        meta["Positive prompt"] = txt_positive if txt_positive is not None else parsed_meta.get("Positive prompt", "")
+        meta["Negative prompt"] = txt_negative if txt_negative is not None else parsed_meta.get("Negative prompt", "")
+
+        for key, value in parsed_meta.items():
+            if key in ("Positive prompt", "Negative prompt"):
+                continue
+            meta[key] = value
+
+        if txt_size:
+            meta["Size"] = txt_size
+        if not meta.get("Size"):
+            meta["Size"] = self._infer_size_from_image(image_path)
+
+        if "Seed" not in meta:
+            seed_value = parsed_meta.get("Seed") if parsed_meta else None
+            if seed_value:
+                meta["Seed"] = seed_value
+
+        return meta, meta_key
 
     def _find_in_text_edit(self, text_edit, query):
         if not query:
@@ -359,14 +593,14 @@ class MainWindow(QMainWindow):
                     text_edit.blockSignals(False)
                     replaced = True
         if replaced:
+            self.current_metadata = self._gather_metadata_from_inputs()
+            self._populate_metadata_tree(self.current_metadata)
             self.statusBar().showMessage("Đã thay thế nội dung")
             if self.chk_autosave.isChecked() and self.current_image_path:
-                self._write_prompt_file(
-                    self.current_image_path,
-                    self.txt_positive.toPlainText(),
-                    self.txt_negative.toPlainText(),
-                    None,
-                )
+                meta = OrderedDict(self.current_metadata)
+                if not meta.get("Size") and self.current_image_path:
+                    meta["Size"] = self._infer_size_from_image(self.current_image_path)
+                self._write_prompt_file(self.current_image_path, meta, self.current_meta_key)
         else:
             self.statusBar().showMessage("Không tìm thấy nội dung để thay thế")
 
@@ -380,32 +614,74 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Chưa có thư mục hoặc ảnh để thay thế")
             return
 
-        replacements = 0
+        image_paths = []
         for idx in range(self.list_images.count()):
             item = self.list_images.item(idx)
             if not item:
                 continue
-            image_path = item.data(Qt.UserRole)
-            positive, negative, size_str = self._read_prompt_data(image_path)
-            original_positive = positive or ""
-            original_negative = negative or ""
-            new_positive = original_positive.replace(find_text, replace_text)
-            new_negative = original_negative.replace(find_text, replace_text)
-            if new_positive != original_positive or new_negative != original_negative:
-                self._write_prompt_file(image_path, new_positive, new_negative, size_str)
-                replacements += 1
-                if image_path == self.current_image_path:
-                    self.txt_positive.blockSignals(True)
-                    self.txt_positive.setPlainText(new_positive)
-                    self.txt_positive.blockSignals(False)
-                    self.txt_negative.blockSignals(True)
-                    self.txt_negative.setPlainText(new_negative)
-                    self.txt_negative.blockSignals(False)
+            path = item.data(Qt.UserRole)
+            if path:
+                image_paths.append(path)
 
-        if replacements:
-            self.statusBar().showMessage(f"Đã thay thế trong {replacements} ảnh")
-        else:
-            self.statusBar().showMessage("Không tìm thấy nội dung để thay thế trong thư mục")
+        total = len(image_paths)
+        if total == 0:
+            self.statusBar().showMessage("Không tìm thấy ảnh hợp lệ trong thư mục")
+            return
+
+        self.replace_worker = ReplaceWorker(self, image_paths, find_text, replace_text)
+        self.replace_thread = QThread(self)
+        self.replace_worker.moveToThread(self.replace_thread)
+
+        progress = QProgressDialog("Đang thay thế nội dung trong ảnh...", "Hủy", 0, total, self)
+        progress.setWindowTitle("Đang xử lý")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        def on_progress(current, maximum, name):
+            progress.setMaximum(maximum)
+            progress.setValue(current)
+            progress.setLabelText(f"Đang xử lý {name} ({current}/{maximum})")
+            QApplication.processEvents()
+
+        def cleanup():
+            if self.replace_thread:
+                thread = self.replace_thread
+                self.replace_thread = None
+                thread.quit()
+                thread.wait()
+                thread.deleteLater()
+            if self.replace_worker:
+                worker = self.replace_worker
+                self.replace_worker = None
+                worker.deleteLater()
+
+        def on_finished(replacements, changed_paths):
+            cancelled = progress.wasCanceled()
+            progress.close()
+            cleanup()
+            if cancelled:
+                self.statusBar().showMessage("Đã hủy thao tác thay thế")
+                return
+            if replacements:
+                self.statusBar().showMessage(f"Đã thay thế trong {replacements} ảnh")
+                if self.current_image_path and self.current_image_path in changed_paths:
+                    self._load_and_apply_metadata(self.current_image_path)
+            else:
+                self.statusBar().showMessage("Không tìm thấy nội dung để thay thế trong thư mục")
+
+        def on_error(message):
+            progress.close()
+            cleanup()
+            self.statusBar().showMessage(f"Lỗi khi thay thế: {message}")
+
+        progress.canceled.connect(self.replace_worker.cancel)
+        self.replace_thread.started.connect(self.replace_worker.run)
+        self.replace_worker.progress.connect(on_progress)
+        self.replace_worker.finished.connect(on_finished)
+        self.replace_worker.error.connect(on_error)
+
+        self.replace_thread.start()
 
     def _normalize_prompt_text(self, text):
         if not text:
@@ -425,113 +701,66 @@ class MainWindow(QMainWindow):
         return "1024x1024"
 
     def _infer_size_from_image(self, image_path):
-        pixmap = QPixmap(image_path)
-        if pixmap.isNull():
+        try:
+            from PIL import Image
+
+            with Image.open(image_path) as img:
+                width, height = img.size
+        except Exception:
             return "832x1216"
-        return self._size_string_from_dimensions(pixmap.width(), pixmap.height())
+        return self._size_string_from_dimensions(width, height)
 
-    def _read_prompt_data(self, image_path):
-        prompt_path = os.path.splitext(image_path)[0] + ".txt"
-        positive = ""
-        negative = ""
-        size_str = None
-        if os.path.exists(prompt_path):
-            try:
-                with open(prompt_path, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                parts = content.split("###")
-                if parts:
-                    positive = parts[0].strip()
-                if len(parts) > 1:
-                    negative = parts[1].strip()
-                if len(parts) > 2 and parts[2].strip():
-                    size_str = parts[2].strip()
-            except Exception:
-                positive = negative = ""
-                size_str = None
-        else:
-            meta_text, _ = self._extract_metadata_text(image_path)
-            if meta_text:
-                meta = self.parse_metadata(meta_text)
-                positive = meta.get("Positive prompt", "")
-                negative = meta.get("Negative prompt", "")
-                size_str = meta.get("Size")
+    def _write_prompt_file(self, image_path, meta, meta_key=None):
+        if meta is None:
+            return
 
-        if not size_str:
-            size_str = self._infer_size_from_image(image_path)
-        return positive, negative, size_str
+        meta = OrderedDict(meta)
+        meta["Positive prompt"] = self._normalize_prompt_text(meta.get("Positive prompt", ""))
+        meta["Negative prompt"] = self._normalize_prompt_text(meta.get("Negative prompt", ""))
 
-    def _write_prompt_file(self, image_path, positive, negative, size_str):
-        positive_text = self._normalize_prompt_text(positive)
-        negative_text = self._normalize_prompt_text(negative)
-
-        if not positive_text:
-            positive_text = "1boy, 1 man"
-        if not negative_text:
-            negative_text = "(1girl, woman, female)"
-        if not size_str:
-            size_str = self._infer_size_from_image(image_path)
-
-        meta_text, meta_key = self._extract_metadata_text(image_path)
-        meta = self.parse_metadata(meta_text) if meta_text else {}
-        meta["Positive prompt"] = positive_text
-        meta["Negative prompt"] = negative_text
-        if size_str:
-            meta["Size"] = size_str
+        if not meta.get("Positive prompt"):
+            meta["Positive prompt"] = "1boy, 1 man"
+        if not meta.get("Negative prompt"):
+            meta["Negative prompt"] = "(1girl, woman, female)"
+        if not meta.get("Size"):
+            meta["Size"] = self._infer_size_from_image(image_path)
 
         formatted_meta = self._format_metadata_text(meta)
 
         ext = os.path.splitext(image_path)[1].lower()
+        target_key = meta_key
+        if meta_key is None:
+            _, target_key = self._extract_metadata_text(image_path)
         if ext in ['.png'] and formatted_meta:
             try:
                 from PIL import Image, PngImagePlugin
 
                 with Image.open(image_path) as img:
                     pnginfo = PngImagePlugin.PngInfo()
-                    target_key = meta_key or 'parameters'
-                    for key, value in getattr(img, 'info', {}).items():
+                    existing_info = getattr(img, 'info', {}) or {}
+                    key_to_use = target_key or 'parameters'
+                    for key, value in existing_info.items():
                         if not isinstance(value, str):
                             continue
-                        if key == target_key:
+                        if key == key_to_use:
                             continue
                         pnginfo.add_text(key, value)
-                    pnginfo.add_text(target_key, formatted_meta)
+                    pnginfo.add_text(key_to_use, formatted_meta)
                     img.save(image_path, pnginfo=pnginfo)
                 return
             except Exception:
                 pass
 
-        # Fallback lưu định dạng txt cũ nếu không ghi được metadata
         prompt_path = os.path.splitext(image_path)[0] + ".txt"
-        content = f"{positive_text}###{negative_text}###{size_str}"
+        content = f"{meta.get('Positive prompt', '')}###{meta.get('Negative prompt', '')}###{meta.get('Size', '')}"
         with open(prompt_path, "w", encoding="utf-8") as f:
             f.write(content)
 
-    def load_metadata_content(self, image_path):
-        # Đọc metadata trực tiếp từ file ảnh (PNG/JPG)
-        import textwrap
-        self.tree_metadata.clear()
-        meta_text, _ = self._extract_metadata_text(image_path)
-        if not meta_text:
-            # Không có metadata
-            return
-        meta = self.parse_metadata(meta_text)
-        wrap_len = 80  # Số ký tự tối đa mỗi dòng
-        for key in [
-            "Positive prompt", "Negative prompt", "Steps", "Sampler", "Schedule type", "CFG scale", "Seed", "Face restoration", "Size", "Width", "Height", "Model hash", "Model", "Clip skip", "Token merging ratio", "Lora hash", "Other", "Version"]:
-            val = meta.get(key, "")
-            if val:
-                # Tự động wrapped nếu quá dài
-                if isinstance(val, str) and len(val) > wrap_len:
-                    val = '\n'.join(textwrap.wrap(val, wrap_len))
-                item = QTreeWidgetItem([key, val])
-                self.tree_metadata.addTopLevelItem(item)
-
     def parse_metadata(self, content):
         if not content:
-            return {}
+            return OrderedDict()
         blocks = re.split(r"(?:\r?\n){2,}", content.strip())
-        selected_meta = {}
+        selected_meta = OrderedDict()
         for block in blocks:
             meta, has_tony = self.parse_block(block)
             if meta:
@@ -542,119 +771,69 @@ class MainWindow(QMainWindow):
         return selected_meta
 
     def parse_block(self, block):
-        technical_fields = [
-            r"Steps\s*:\s*\d+",
-            r"Sampler\s*:\s*[^,\n]+",
-            r"CFG scale\s*:\s*[^,\n]+",
-            r"Size\s*:\s*\d+[xX×]\d+",
-            r"Seed\s*:\s*\d+",
-            r"Model\s*:\s*[^,\n]+",
-            r"Width\s*:\s*\d+",
-            r"Height\s*:\s*\d+"
-        ]
-        tech_pattern = re.compile(r"|".join(technical_fields), re.IGNORECASE)
-
         lines = [line.strip() for line in block.strip().split("\n") if line.strip()]
         if not lines:
-            return {}, False
+            return OrderedDict(), False
 
-        prompt_lines, negative_lines = [], []
-        tech_data = {}
+        positive_lines = []
+        negative_lines = []
+        metadata_pairs = OrderedDict()
         in_negative = False
-        width = height = seed = None
-        size_str = None
         has_tony = any(line.lower().endswith("tony") for line in lines)
-        field_map = {
-            "steps": "Steps",
-            "sampler": "Sampler",
-            "cfg scale": "CFG scale",
-            "size": "Size",
-            "seed": "Seed",
-            "model": "Model",
-            "width": "Width",
-            "height": "Height"
-        }
 
         for line in lines:
-            lower_line = line.lower()
+            stripped = line.strip()
+            lower_line = stripped.lower()
             if lower_line.startswith("negative prompt:"):
                 in_negative = True
-                negative_lines.append(line.split(":", 1)[1].strip())
+                remainder = stripped.split(":", 1)[1].strip()
+                if remainder:
+                    negative_lines.append(remainder)
+                continue
+            if in_negative and not self._looks_like_metadata(stripped):
+                negative_lines.append(stripped)
+                continue
+            if self._looks_like_metadata(stripped):
+                in_negative = False
+                for key, value in self._split_metadata_pairs(stripped):
+                    metadata_pairs[key] = value
                 continue
             if in_negative:
-                if tech_pattern.search(line):
-                    in_negative = False
-                else:
-                    negative_lines.append(line)
-                    continue
-            if tech_pattern.search(line):
-                segments = [seg.strip() for seg in re.split(r",\s*(?=[^:,]+:\s*)", line) if seg.strip()]
-                for segment in segments:
-                    if not re.search(r":", segment):
-                        continue
-                    parts = segment.split(":", 1)
-                    key_raw = parts[0].strip()
-                    value = parts[1].strip().strip(",")
-                    canonical = field_map.get(key_raw.lower(), key_raw)
-                    tech_data[canonical] = value
-                    m = re.search(r"Width\s*:\s*(\d+)", segment, re.IGNORECASE)
-                    if m:
-                        width = int(m.group(1))
-                    m = re.search(r"Height\s*:\s*(\d+)", segment, re.IGNORECASE)
-                    if m:
-                        height = int(m.group(1))
-                    m = re.search(r"Size\s*:\s*(\d+)[xX×](\d+)", segment, re.IGNORECASE)
-                    if m:
-                        width = int(m.group(1))
-                        height = int(m.group(2))
-                    m = re.search(r"Seed\s*:\s*(\d+)", segment, re.IGNORECASE)
-                    if m:
-                        seed = int(m.group(1))
-                continue
-            if not lower_line.startswith("negative prompt:"):
-                prompt_lines.append(line)
-
-        prompt = " ".join(prompt_lines).replace("  ", " ").replace(" , ", ", ").strip()
-        negative_prompt = " ".join(negative_lines).replace("  ", " ").replace(" , ", ",").strip()
-        if not negative_prompt:
-            negative_prompt = "(1girl, female, woman, vagina,pussy,vaginal,clitoris, beard)"
-
-        if width and height:
-            if width > height:
-                size_str = "1216x832"
-            elif width < height:
-                size_str = "832x1216"
+                negative_lines.append(stripped)
             else:
-                size_str = "1024x1024"
-        else:
-            size_str = "832x1216"
-        seed_val = seed if seed is not None else -1
+                positive_lines.append(stripped)
 
-        meta = {
-            "Positive prompt": prompt,
-            "Negative prompt": negative_prompt,
-            "Size": size_str,
-            "Seed": str(seed_val)
-        }
-        for key in ("Steps", "Sampler", "CFG scale", "Model", "Width", "Height"):
-            if key in tech_data:
-                meta[key] = tech_data[key]
-        if "Width" not in meta and width:
-            meta["Width"] = str(width)
-        if "Height" not in meta and height:
-            meta["Height"] = str(height)
+        positive_prompt = " ".join(positive_lines).strip()
+        negative_prompt = " ".join(negative_lines).strip()
+
+        meta = OrderedDict()
+        meta["Positive prompt"] = positive_prompt
+        meta["Negative prompt"] = negative_prompt
+
+        for key, value in metadata_pairs.items():
+            meta[key] = value
+
+        width = self._to_int(metadata_pairs.get("Width"))
+        height = self._to_int(metadata_pairs.get("Height"))
+        if ("Size" not in meta or not meta.get("Size")) and width and height:
+            meta["Size"] = self._size_string_from_dimensions(width, height)
+        if "Seed" not in meta and metadata_pairs.get("Seed") is not None:
+            meta["Seed"] = metadata_pairs.get("Seed")
+
         return meta, has_tony
+
 
     def save_prompt_file(self):
         if not self.current_image_path:
             return
 
-        self._write_prompt_file(
-            self.current_image_path,
-            self.txt_positive.toPlainText(),
-            self.txt_negative.toPlainText(),
-            None,
-        )
+        meta = self._gather_metadata_from_inputs()
+        if not meta.get("Size"):
+            meta["Size"] = self._infer_size_from_image(self.current_image_path)
+        self.current_metadata = meta
+        self._write_prompt_file(self.current_image_path, meta, self.current_meta_key)
+        self._populate_metadata_tree(meta)
+        self.statusBar().showMessage("Đã lưu metadata vào ảnh")
 
     def handle_dropped_images(self, image_paths):
         if not image_paths:
@@ -683,7 +862,7 @@ class MainWindow(QMainWindow):
         # Hiển thị ảnh đầu tiên trong danh sách kéo vào
         self.list_images.setCurrentRow(0)
         self.display_image_from_path(image_paths[0])
-        self.load_prompt_file(image_paths[0])
+        self._load_and_apply_metadata(image_paths[0])
 
     def keyPressEvent(self, event):
         key = event.key()
