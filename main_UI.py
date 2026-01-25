@@ -2,16 +2,25 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QPushButton, QLabel,
     QFileDialog, QHBoxLayout, QVBoxLayout, QTextEdit, QCheckBox,
     QListWidget, QListWidgetItem, QSplitter, QSizePolicy, QFrame, QTreeWidgetItem,
-    QLineEdit, QGridLayout, QProgressDialog
+    QLineEdit, QGridLayout, QProgressDialog, QComboBox
 )
 from PyQt5.QtGui import QIcon, QPixmap, QDragEnterEvent, QDropEvent, QTextCursor, QFontMetrics
 from PyQt5.QtCore import Qt, QSize, QEvent, pyqtSignal, QObject, QThread
 import sys
 import os
 import warnings
+
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 import re
 from collections import OrderedDict
+
+# Default value used when Add Meta tab's Negative prompt is left empty.
+DEFAULT_NEGATIVE_PROMPT = (
+    "logo, source pony, beard, (yellow skin:0.8), ((long hair:1.5)), "
+    "((child male, minor)), ((underage)), (childish), (adolescent), ((young girl))"
+)
+
 
 class ImageDropLabel(QLabel):
     def __init__(self, parent=None):
@@ -19,11 +28,11 @@ class ImageDropLabel(QLabel):
         self.setAcceptDrops(True)
         self.image_dropped_callback = None
 
-    def dragEnterEvent(self, event):
+    def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
-    def dropEvent(self, event):
+    def dropEvent(self, event: QDropEvent):
         image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.webp']
         image_paths = []
         for url in event.mimeData().urls():
@@ -69,11 +78,13 @@ class ReplaceWorker(QObject):
             self.finished.emit(replacements, changed_paths)
         except Exception as exc:
             self.error.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Image Prompt Manager")
-        self.setGeometry(100, 100, 1000, 700)
+        self.setGeometry(100, 100, 1100, 750)
 
         self.folder_path = ""
         self.current_image_path = ""
@@ -83,25 +94,22 @@ class MainWindow(QMainWindow):
         self.current_metadata_text = ""
         self.replace_thread = None
         self.replace_worker = None
+        self.default_negative_prompt = DEFAULT_NEGATIVE_PROMPT
+        self._image_type_filter = 'all'
 
         self.init_ui()
         self.statusBar().showMessage("Ready")
 
     def init_ui(self):
-        # Widget trung tâm
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
 
-        # Layout chính
         main_layout = QVBoxLayout()
         main_widget.setLayout(main_layout)
 
-        # Layout cho thanh chọn thư mục
         folder_layout = QHBoxLayout()
-
         self.btn_browse = QPushButton("Open Folder")
         self.btn_browse.setIcon(QIcon.fromTheme("folder"))
-        # self.btn_browse.setFixedSize(32, 32)
         self.btn_browse.clicked.connect(self.choose_folder)
 
         self.lbl_folder = QLabel("Chưa chọn thư mục")
@@ -111,25 +119,24 @@ class MainWindow(QMainWindow):
         folder_layout.addWidget(self.btn_browse)
         folder_layout.addWidget(self.lbl_folder)
 
-        # Split panel chính chia làm 2: Trái (ảnh) - Phải (prompt)
         self.main_splitter = QSplitter(Qt.Horizontal)
 
-        # ----- KHU HÌNH ẢNH (TRÁI) -----
+        # ----- IMAGE PANEL (LEFT) -----
         image_widget = QWidget()
         image_layout = QVBoxLayout()
         image_widget.setLayout(image_layout)
-        image_widget.setMinimumWidth(400)
+        image_widget.setMinimumWidth(420)
 
         self.lbl_image = ImageDropLabel("Kéo ảnh vào đây hoặc chọn từ danh sách")
         self.lbl_image.setAlignment(Qt.AlignCenter)
         self.lbl_image.setFrameShape(QFrame.Box)
-        self.lbl_image.setMinimumHeight(400)
+        self.lbl_image.setMinimumHeight(420)
         self.lbl_image.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.lbl_image.image_dropped_callback = self.handle_dropped_images
         self.lbl_image.installEventFilter(self)
 
         self.list_images = QListWidget()
-        self.list_images.setMinimumHeight(180)
+        self.list_images.setMinimumHeight(200)
         self.list_images.setViewMode(QListWidget.IconMode)
         self.list_images.setIconSize(QSize(100, 100))
         self.list_images.setResizeMode(QListWidget.Adjust)
@@ -141,16 +148,16 @@ class MainWindow(QMainWindow):
         image_layout.addWidget(self.lbl_image, 3)
         image_layout.addWidget(self.list_images, 1)
 
-        # ----- KHU PROMPT (PHẢI) -----
-        # Tab Layout cho Prompt
-        from PyQt5.QtWidgets import QTabWidget, QTreeWidget, QTreeWidgetItem
+        # ----- PROMPT PANEL (RIGHT) -----
+        from PyQt5.QtWidgets import QTabWidget, QTreeWidget, QPlainTextEdit
         self.tab_prompt = QTabWidget()
-        self.tab_prompt.setMinimumWidth(300)
+        self.tab_prompt.setMinimumWidth(340)
 
-        # Tab Content (chỉ đọc metadata)
+        # Tab Content (readonly)
         self.tab_content = QWidget()
         content_layout = QVBoxLayout()
         self.tab_content.setLayout(content_layout)
+
         self.tree_metadata = QTreeWidget()
         self.tree_metadata.setHeaderLabels(["Keyword", "Content"])
         self.tree_metadata.setColumnCount(2)
@@ -159,52 +166,105 @@ class MainWindow(QMainWindow):
         self.tree_metadata.setWordWrap(True)
         content_layout.addWidget(self.tree_metadata)
 
-        # Tab Edit (giữ layout cũ)
+        # Tab Edit (legacy)
         self.tab_edit = QWidget()
         edit_layout = QVBoxLayout()
         self.tab_edit.setLayout(edit_layout)
+
         self.txt_metadata = QTextEdit()
         self.txt_metadata.setPlaceholderText("Metadata (original parse block)")
         self.txt_metadata.setAcceptRichText(False)
+
         replace_widget = QWidget()
         replace_layout = QGridLayout()
         replace_widget.setLayout(replace_layout)
         replace_layout.setColumnStretch(0, 1)
         replace_layout.setColumnStretch(1, 1)
+
         self.txt_find = QLineEdit()
         self.txt_find.setPlaceholderText("Find text")
         self.txt_replace = QLineEdit()
         self.txt_replace.setPlaceholderText("Replace with")
+
         self.btn_find = QPushButton("Find")
         self.btn_find.clicked.connect(self.find_in_prompts)
         self.btn_replace = QPushButton("Replace")
         self.btn_replace.clicked.connect(self.replace_in_prompts)
         self.btn_replace_all = QPushButton("Replace All")
         self.btn_replace_all.clicked.connect(self.replace_all_in_prompts)
+
         replace_layout.addWidget(self.txt_find, 0, 0, 1, 2)
         replace_layout.addWidget(self.btn_find, 0, 2)
         replace_layout.addWidget(self.txt_replace, 1, 0, 1, 2)
         replace_layout.addWidget(self.btn_replace, 1, 2)
         replace_layout.addWidget(self.btn_replace_all, 2, 0, 1, 3)
+
         self.chk_autosave = QCheckBox("Auto Save")
         self.btn_save = QPushButton("Save")
         self.btn_save.clicked.connect(self.save_prompt_file)
+
         edit_layout.addWidget(self.txt_metadata)
         edit_layout.addWidget(replace_widget)
         edit_layout.addWidget(self.chk_autosave)
         edit_layout.addWidget(self.btn_save)
 
+        # Tab Add Meta
+        self.tab_add_meta = QWidget()
+        add_layout = QVBoxLayout()
+        self.tab_add_meta.setLayout(add_layout)
+
+        self.lbl_add_filter = QLabel("Filter images")
+        self.cbo_add_image = QComboBox()
+        self.cbo_add_image.addItem("All images", "all")
+        self.cbo_add_image.addItem("PNG (*.png)", "png")
+        self.cbo_add_image.addItem("JPG/JPEG (*.jpg;*.jpeg)", "jpg")
+        self.cbo_add_image.addItem("WEBP (*.webp)", "webp")
+        self.cbo_add_image.addItem("BMP (*.bmp)", "bmp")
+        self.cbo_add_image.addItem("Non-PNG (everything except .png)", "non_png")
+        self.cbo_add_image.addItem("Other formats", "other")
+        self.cbo_add_image.currentIndexChanged.connect(self.on_add_meta_filter_changed)
+
+        self.lbl_add_pos = QLabel("Positive prompt")
+        self.txt_add_pos = QPlainTextEdit()
+        self.txt_add_pos.setPlaceholderText("Nhập Positive prompt...")
+
+        self.lbl_add_neg = QLabel("Negative prompt")
+        self.txt_add_neg = QPlainTextEdit()
+        self.txt_add_neg.setPlaceholderText("Nhập Negative prompt... (để trống sẽ dùng mặc định)")
+
+        self.lbl_add_size = QLabel("Size (from image)")
+        self.txt_add_size = QLineEdit()
+        self.txt_add_size.setReadOnly(True)
+
+        self.lbl_add_png_status = QLabel("")
+        self.lbl_add_png_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        self.btn_save_meta_to_image = QPushButton("Save Meta to Image")
+        self.btn_save_meta_to_image.clicked.connect(self.save_meta_to_image)
+        self.btn_save_meta_to_image.setEnabled(False)
+
+        add_layout.addWidget(self.lbl_add_filter)
+        add_layout.addWidget(self.cbo_add_image)
+
+        add_layout.addWidget(self.lbl_add_pos)
+        add_layout.addWidget(self.txt_add_pos, 2)
+        add_layout.addWidget(self.lbl_add_neg)
+        add_layout.addWidget(self.txt_add_neg, 2)
+        add_layout.addWidget(self.lbl_add_size)
+        add_layout.addWidget(self.txt_add_size)
+        add_layout.addWidget(self.lbl_add_png_status)
+        add_layout.addWidget(self.btn_save_meta_to_image)
+
         self.tab_prompt.addTab(self.tab_content, "Content")
         self.tab_prompt.addTab(self.tab_edit, "Edit")
+        self.tab_prompt.addTab(self.tab_add_meta, "Add Meta")
 
-        # Thêm vào splitter
         self.main_splitter.addWidget(image_widget)
         self.main_splitter.addWidget(self.tab_prompt)
-        self.main_splitter.setSizes([600, 400])
+        self.main_splitter.setSizes([650, 450])
         self.main_splitter.setStretchFactor(0, 1)
         self.main_splitter.setStretchFactor(1, 0)
 
-        # Đặt tỉ lệ cho layout
         main_layout.addLayout(folder_layout, 0)
         main_layout.addWidget(self.main_splitter, 1)
 
@@ -219,7 +279,6 @@ class MainWindow(QMainWindow):
     def load_images_from_folder(self, folder):
         self.list_images.clear()
         image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.webp']
-
         image_files = [f for f in os.listdir(folder) if any(f.lower().endswith(ext) for ext in image_extensions)]
         image_files.sort()
         metrics = QFontMetrics(self.list_images.font())
@@ -227,7 +286,7 @@ class MainWindow(QMainWindow):
         total = len(image_files)
         progress = None
         if total:
-            progress = QProgressDialog("Đang tải danh sách ảnh...", "Hủy", 0, total, self)
+            progress = QProgressDialog("Loading Image", "Hủy", 0, total, self)
             progress.setWindowTitle("Đang tải ảnh")
             progress.setWindowModality(Qt.ApplicationModal)
             progress.setMinimumDuration(0)
@@ -251,10 +310,16 @@ class MainWindow(QMainWindow):
         if progress:
             progress.close()
 
-        if self.list_images.count() > 0:
-            self.list_images.setCurrentRow(0)
-            self.display_selected_image(self.list_images.item(0))
 
+        self._apply_image_type_filter()
+
+        if self.list_images.count() > 0:
+            for i in range(self.list_images.count()):
+                item = self.list_images.item(i)
+                if item and not item.isHidden():
+                    self.list_images.setCurrentRow(i)
+                    self.display_selected_image(item)
+                    break
     def display_selected_image(self, item):
         if self.chk_autosave.isChecked():
             self.save_prompt_file()
@@ -277,9 +342,7 @@ class MainWindow(QMainWindow):
 
     def update_image_display(self):
         if not self.current_pixmap.isNull() and not self.lbl_image.size().isEmpty():
-            scaled = self.current_pixmap.scaled(
-                self.lbl_image.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
+            scaled = self.current_pixmap.scaled(self.lbl_image.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.lbl_image.setPixmap(scaled)
 
     def resizeEvent(self, event):
@@ -423,6 +486,7 @@ class MainWindow(QMainWindow):
         if not meta:
             return
         import textwrap
+
         wrap_len = 80
         for key, value in meta.items():
             if value is None:
@@ -438,10 +502,13 @@ class MainWindow(QMainWindow):
         self.current_metadata_dict = meta
         self.current_meta_key = meta_key
         self.current_metadata_text = meta_text or ""
+
         self.txt_metadata.blockSignals(True)
         self.txt_metadata.setPlainText(self.current_metadata_text)
         self.txt_metadata.blockSignals(False)
         self._populate_metadata_tree(meta)
+
+        self._update_add_meta_tab(meta, meta_key, meta_text)
 
     def _load_image_metadata(self, image_path):
         meta_text, meta_key = self._extract_metadata_text(image_path)
@@ -558,7 +625,7 @@ class MainWindow(QMainWindow):
         self.replace_thread = QThread(self)
         self.replace_worker.moveToThread(self.replace_thread)
 
-        progress = QProgressDialog("Đang thay thế nội dung trong ảnh...", "Hủy", 0, total, self)
+        progress = QProgressDialog, QComboBox("Đang thay thế nội dung trong ảnh...", "Hủy", 0, total, self)
         progress.setWindowTitle("Đang xử lý")
         progress.setWindowModality(Qt.ApplicationModal)
         progress.setMinimumDuration(0)
@@ -613,15 +680,14 @@ class MainWindow(QMainWindow):
         if not width or not height:
             return "832x1216"
         if width > height:
-            return "1216x832"
+            return f"{width}x{height}"
         if width < height:
-            return "832x1216"
-        return "1024x1024"
+            return f"{width}x{height}"
+        return f"{width}x{height}"
 
     def _infer_size_from_image(self, image_path):
         try:
             from PIL import Image
-
             with Image.open(image_path) as img:
                 width, height = img.size
         except Exception:
@@ -636,6 +702,7 @@ class MainWindow(QMainWindow):
         target_key = meta_key
         if meta_key is None:
             _, target_key = self._extract_metadata_text(image_path)
+
         if ext == '.png':
             try:
                 from PIL import Image, PngImagePlugin
@@ -727,7 +794,6 @@ class MainWindow(QMainWindow):
 
         return meta, has_tony
 
-
     def save_prompt_file(self):
         if not self.current_image_path:
             return
@@ -740,18 +806,248 @@ class MainWindow(QMainWindow):
         if used_key and used_key != self.current_meta_key:
             self.current_meta_key = used_key
         self._populate_metadata_tree(self.current_metadata_dict)
+        self._update_add_meta_tab(self.current_metadata_dict, self.current_meta_key, self.current_metadata_text)
         self.statusBar().showMessage("Đã lưu metadata vào ảnh")
 
+    # ---------- Add Meta ----------
+    def _is_meaningful_metadata(self, meta: OrderedDict) -> bool:
+        """Meaningful = has any parsed prompt/data beyond inferred Size-only."""
+        if not meta:
+            return False
+        positive = (meta.get("Positive prompt") or "").strip()
+        negative = (meta.get("Negative prompt") or "").strip()
+        if positive or negative:
+            return True
+        for key, value in meta.items():
+            if key in ("Positive prompt", "Negative prompt", "Size"):
+                continue
+            if value is None:
+                continue
+            if str(value).strip():
+                return True
+        return False
+
+
+    def _update_add_meta_tab(self, meta_for_tree, meta_key, meta_text):
+        if not self.current_image_path:
+            self.btn_save_meta_to_image.setEnabled(False)
+            self.lbl_add_png_status.setText("")
+            return
+
+        size = self._infer_size_from_image(self.current_image_path)
+        self.txt_add_size.setText(size)
+
+        positive = (meta_for_tree.get("Positive prompt") or "").strip() if meta_for_tree else ""
+        negative = (meta_for_tree.get("Negative prompt") or "").strip() if meta_for_tree else ""
+        self.txt_add_pos.setPlainText(positive)
+        self.txt_add_neg.setPlainText(negative)
+
+        is_png = self.current_image_path.lower().endswith(".png")
+        if is_png:
+            self.lbl_add_png_status.setStyleSheet("font-weight: bold; color: #17a24b;")
+            self.lbl_add_png_status.setText("PNG detected: metadata will be embedded into the image.")
+        else:
+            self.lbl_add_png_status.setStyleSheet("font-weight: bold; color: #d11b1b;")
+            self.lbl_add_png_status.setText("Not PNG: file will be converted & saved as PNG with embedded metadata.")
+
+        enable = (not is_png) or (is_png and (not self._is_meaningful_metadata(meta_for_tree)))
+        self.btn_save_meta_to_image.setEnabled(enable)
+
+    def on_add_meta_filter_changed(self, _index: int):
+        """Filter the left thumbnail list by image type (PNG/JPG/...)."""
+        self._image_type_filter = self.cbo_add_image.currentData() or "all"
+        self._apply_image_type_filter()
+
+    def _apply_image_type_filter(self):
+        wanted = getattr(self, "_image_type_filter", "all") or "all"
+
+        def match(path: str) -> bool:
+            ext = os.path.splitext(path)[1].lower()
+            if wanted == "all":
+                return True
+            if wanted == "png":
+                return ext == ".png"
+            if wanted == "jpg":
+                return ext in (".jpg", ".jpeg")
+            if wanted == "webp":
+                return ext == ".webp"
+            if wanted == "bmp":
+                return ext == ".bmp"
+            if wanted == "non_png":
+                return ext != ".png"
+            if wanted == "other":
+                return ext not in (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+            return True
+
+        any_visible = False
+        for i in range(self.list_images.count()):
+            item = self.list_images.item(i)
+            if not item:
+                continue
+            path = item.data(Qt.UserRole)
+            visible = bool(path) and match(path)
+            item.setHidden(not visible)
+            any_visible = any_visible or visible
+
+        # Ensure current selection stays visible
+        current = self.list_images.currentItem()
+        if current is None or current.isHidden():
+            for i in range(self.list_images.count()):
+                item = self.list_images.item(i)
+                if item and not item.isHidden():
+                    self.list_images.setCurrentRow(i)
+                    self.display_selected_image(item)
+                    break
+
+        if not any_visible:
+            self.lbl_image.setText("No images match the selected filter.")
+
+
+    def _ensure_unique_png_path(self, src_path: str) -> str:
+        folder = os.path.dirname(src_path)
+        stem = os.path.splitext(os.path.basename(src_path))[0]
+        candidate = os.path.join(folder, f"{stem}.png")
+        if not os.path.exists(candidate):
+            return candidate
+        i = 1
+        while True:
+            candidate = os.path.join(folder, f"{stem}_meta_{i}.png")
+            if not os.path.exists(candidate):
+                return candidate
+            i += 1
+
+    def _build_stable_diffusion_metadata_text(self, positive: str, negative: str, size: str) -> str:
+        """
+        Stable Diffusion (A1111-style) prompt format:
+            <positive>
+            Negative prompt: <negative>
+            Steps: ..., Sampler: ..., CFG scale: ..., Seed: ..., Size: WxH, Version: ...
+        """
+        positive = (positive or "").strip()
+        negative = (negative or "").strip()
+        size = (size or "").strip()
+
+        extras_defaults = OrderedDict([
+            ("Steps", "25"),
+            ("Sampler", "Euler a"),
+            ("Schedule type", "Automatic"),
+            ("CFG scale", "7"),
+            ("Seed", "0"),
+            ("Size", size or "832x1216"),
+            ("Version", "v1.10.1"),
+        ])
+
+        lines = []
+        if positive:
+            lines.append(positive)
+        if negative:
+            lines.append(f"Negative prompt: {negative}")
+        else:
+            lines.append("Negative prompt:")
+
+        extras_line = ", ".join([f"{k}: {v}" for k, v in extras_defaults.items() if v is not None and str(v).strip()])
+        if extras_line:
+            lines.append(extras_line)
+        return "\n".join(lines).strip()
+
+    def save_meta_to_image(self):
+        if not self.current_image_path:
+            return
+
+        positive = self.txt_add_pos.toPlainText().strip()
+        negative = self.txt_add_neg.toPlainText().strip()
+        if not negative:
+            negative = (self.default_negative_prompt or "").strip()
+
+        size = self._infer_size_from_image(self.current_image_path)
+        self.txt_add_size.setText(size)
+
+        metadata_text = self._build_stable_diffusion_metadata_text(positive, negative, size)
+
+        src_path = self.current_image_path
+        src_ext = os.path.splitext(src_path)[1].lower()
+        dst_path = src_path if src_ext == ".png" else self._ensure_unique_png_path(src_path)
+
+        try:
+            from PIL import Image, PngImagePlugin
+
+            with Image.open(src_path) as img:
+                if img.mode not in ("RGB", "RGBA"):
+                    img = img.convert("RGBA")
+
+                pnginfo = PngImagePlugin.PngInfo()
+                if src_ext == ".png":
+                    existing_info = getattr(img, "info", {}) or {}
+                    for key, value in existing_info.items():
+                        if not isinstance(value, str):
+                            continue
+                        if key == "parameters":
+                            continue
+                        pnginfo.add_text(key, value)
+
+                pnginfo.add_text("parameters", metadata_text)
+                img.save(dst_path, format="PNG", pnginfo=pnginfo)
+
+            # Refresh UI / list & reselect
+            if dst_path != src_path:
+                try:
+                    if os.path.exists(src_path):
+                        os.remove(src_path)
+                except Exception:
+                    pass
+                folder = os.path.dirname(dst_path)
+                self.load_images_from_folder(folder)
+                self._select_image_by_path(dst_path)
+            else:
+                self._load_and_apply_metadata(dst_path)
+            self.statusBar().showMessage(f"Đã lưu PNG + metadata: {os.path.basename(dst_path)}")
+        except Exception as exc:
+            self.statusBar().showMessage(f"Lỗi khi lưu PNG metadata: {exc}")
+
+    def _add_or_select_image_in_list(self, new_path: str):
+        # Ensure current folder list includes the new PNG and select it
+        folder = os.path.dirname(new_path)
+        if not self.folder_path or os.path.normpath(self.folder_path) != os.path.normpath(folder):
+            self.folder_path = folder
+            self.lbl_folder.setText(folder)
+            self.load_images_from_folder(folder)
+            self._select_image_by_path(new_path)
+            return
+
+        for i in range(self.list_images.count()):
+            item = self.list_images.item(i)
+            if item and item.data(Qt.UserRole) == new_path:
+                self.list_images.setCurrentRow(i)
+                self.display_selected_image(item)
+                return
+
+        metrics = QFontMetrics(self.list_images.font())
+        icon = QIcon(new_path)
+        display_name = metrics.elidedText(os.path.basename(new_path), Qt.ElideMiddle, 140)
+        item = QListWidgetItem(icon, display_name)
+        item.setData(Qt.UserRole, new_path)
+        item.setToolTip(os.path.basename(new_path))
+        self.list_images.addItem(item)
+        self.list_images.setCurrentItem(item)
+        self.display_selected_image(item)
+
+    def _select_image_by_path(self, path: str):
+        for i in range(self.list_images.count()):
+            item = self.list_images.item(i)
+            if item and item.data(Qt.UserRole) == path:
+                self.list_images.setCurrentRow(i)
+                self.display_selected_image(item)
+                return
+
+    # ---------- Drag&Drop ----------
     def handle_dropped_images(self, image_paths):
         if not image_paths:
             return
 
-        # Cập nhật folder_path và label
         folder = os.path.dirname(image_paths[0])
         self.folder_path = folder
         self.lbl_folder.setText(folder)
 
-        # Lưu danh sách ảnh vào thư mục đó (không trùng)
         image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.webp']
         all_images = sorted([f for f in os.listdir(folder) if any(f.lower().endswith(ext) for ext in image_extensions)])
 
@@ -766,11 +1062,15 @@ class MainWindow(QMainWindow):
             item.setToolTip(file)
             self.list_images.addItem(item)
 
-        # Hiển thị ảnh đầu tiên trong danh sách kéo vào
-        self.list_images.setCurrentRow(0)
-        self.display_image_from_path(image_paths[0])
-        self._load_and_apply_metadata(image_paths[0])
 
+        self._apply_image_type_filter()
+
+        for i in range(self.list_images.count()):
+            item = self.list_images.item(i)
+            if item and not item.isHidden():
+                self.list_images.setCurrentRow(i)
+                self.display_selected_image(item)
+                break
     def keyPressEvent(self, event):
         key = event.key()
         if key in (Qt.Key_Right, Qt.Key_D):
@@ -781,13 +1081,13 @@ class MainWindow(QMainWindow):
     def navigate_image(self, step):
         current_row = self.list_images.currentRow()
         total = self.list_images.count()
+        if total <= 0:
+            return
         next_row = (current_row + step) % total
         self.list_images.setCurrentRow(next_row)
         item = self.list_images.item(next_row)
         if item:
             self.display_selected_image(item)
-
-    
 
 
 if __name__ == '__main__':
@@ -795,7 +1095,7 @@ if __name__ == '__main__':
     try:
         with open("ElegantDark.qss", "r") as f:
             app.setStyleSheet(f.read())
-    except:
+    except Exception:
         pass
     window = MainWindow()
     window.show()
